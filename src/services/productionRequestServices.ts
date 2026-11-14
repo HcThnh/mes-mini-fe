@@ -72,7 +72,11 @@ export interface DraftPurchaseOrderResponse {
 
 export interface ProductionRequestById extends ProductionRequest {
     workOrderFulfillments: {
-        workOrder: any;
+        fulfilledQuantity: number;
+        workOrder: {
+            status: string;
+            quantity: number;
+        } | null;
     }[];
     purchaseOrderDetails: {
         component: {
