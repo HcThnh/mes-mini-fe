@@ -1,0 +1,926 @@
+import { 
+  Plus, Trash2, 
+  Save, Send, FileText, Loader2, Paperclip, X, Building2, Mail, Phone, MapPin, Search
+} from "lucide-react";
+import { useState, useEffect, type JSX, useRef } from "react";
+import { useLocation } from "react-router-dom";
+
+import { supplierService, type Supplier, type SupplierComponent } from "../../../services/supplierServices";
+import { componentService } from "../../../services/componentServices";
+import { purchaseOrderService } from "../../../services/purchaseOrderServices";
+import { SuccessNotification } from "../../Notification/SuccessNotification";
+import { WarehouseServices, type Warehouse } from "../../../services/warehouseServices";
+import { WarningNotification } from "../../Notification/WarningNotification";
+import { hasPermission } from "../../../lib/auth";
+
+interface OrderRow {
+  id: number;
+  componentId: number;
+  componentName: string;
+  quantity: number;
+  unitPrice: number;
+  total: number;
+  productionRequestId?: number;
+}
+
+export const CreateComponentOrder = (): JSX.Element => {
+  const location = useLocation();
+  const draftPO = location.state?.draftPO;
+
+  const [suppliersList, setSuppliersList] = useState<Supplier[]>([]);
+  const [componentsList, setComponentsList] = useState<SupplierComponent[]>([]); 
+  
+  const [selectedWarehouseId, setSelectedWarehouseId] = useState<number | "">("");
+
+  const [isLoadingData, setIsLoadingData] = useState(true);
+  const [isLoadingComponents, setIsLoadingComponents] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const [selectedSupplierId, setSelectedSupplierId] = useState<number | "">("");
+  const [supplierInfo, setSupplierInfo] = useState<Supplier | null>(null);
+  
+  const [orderDate, setOrderDate] = useState(new Date().toISOString().split('T')[0]);
+  const [deliveryDate, setDeliveryDate] = useState("");
+  const [priority, setPriority] = useState("MEDIUM");
+  const [note, setNote] = useState(draftPO ? `Auto-generated for PR: ${draftPO.productionRequestCode}` : "");
+
+  const [rows, setRows] = useState<OrderRow[]>(draftPO ? draftPO.components.map((c: any, index: number) => ({
+    id: Date.now() + index,
+    componentId: c.componentId,
+    componentName: c.componentName,
+    quantity: c.shortageQty,
+    unitPrice: 0,
+    total: 0,
+    productionRequestId: draftPO.productionRequestId
+  })) : []);
+
+  const [taxRate, setTaxRate] = useState<number>(10);
+  const [shippingCost, setShippingCost] = useState<number>(0);
+  const [paymentTerm, setPaymentTerm] = useState("Net 30");
+  const [deliveryTerm, setDeliveryTerm] = useState("FOB - Free On Board");
+
+  const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [showSuccess, setShowSuccess] = useState(false);
+  const [message, setMessage] = useState("");
+
+  const [warehousesList, setWarehousesList] = useState<Warehouse[]>([]);
+  const [showWarning, setShowWarning] = useState(false);
+  const [messageWarning, setMessageWarning] = useState("");
+
+  const [showSupplierSearch, setShowSupplierSearch] = useState(false);
+  const [searchComponent, setSearchComponent] = useState("");
+  const [foundComponents, setFoundComponents] = useState<any[]>([]);
+  const [foundSuppliers, setFoundSuppliers] = useState<Supplier[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchStep, setSearchStep] = useState<'COMPONENT' | 'SUPPLIER'>('COMPONENT');    const isSearchingRef = useRef(false);
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const suppliers = await supplierService.getAllSuppliers();
+        setSuppliersList(Array.isArray(suppliers) ? suppliers : (suppliers as any).data || []);
+        
+        const warehouses = await WarehouseServices.getAllWarehouse();
+        const warehousesData: Warehouse[] = Array.isArray(warehouses) ? warehouses : (warehouses as any).data || [];
+        setWarehousesList(warehousesData.filter(item => item.warehouseType === "COMPONENT"));
+      } catch (error) {
+        console.error("Failed to load initial data", error);
+      } finally {
+        setIsLoadingData(false);
+      }
+    };
+    fetchData();
+  }, []);
+
+  useEffect(() => {
+    const autoFindSuppliers = async () => {
+      if (draftPO && draftPO.components.length > 0) {
+        const firstComp = draftPO.components[0];
+        await handleSelectComponent(firstComp.componentId);
+      }
+    };
+    autoFindSuppliers();
+  }, [suppliersList]);
+  useEffect(() => {
+    const fetchComponentsBySupplier = async () => {
+      if (!selectedSupplierId) {
+        setComponentsList([]);
+        return;
+      }
+
+      setIsLoadingComponents(true);
+      try {
+        const components = await supplierService.getSupplierComponents(Number(selectedSupplierId));
+        setComponentsList(components);
+      } catch (error) {
+        console.error("Failed to load components for this supplier", error);
+        setComponentsList([]);
+      } finally {
+        setIsLoadingComponents(false);
+      }
+    };
+
+    fetchComponentsBySupplier();
+  }, [selectedSupplierId]);
+  useEffect(() => {
+    if (selectedSupplierId && !isLoadingComponents && rows.length > 0) {
+      setRows(currentRows => {
+        // Only perform validation if the componentsList has actually been populated
+        if (componentsList.length === 0) return currentRows;
+
+        let removedCount = 0;
+        const validRows = currentRows.filter(row => {
+          if (row.componentId === 0) return true;
+          const isProvided = componentsList.some(c => c.componentId === row.componentId);
+          if (!isProvided) removedCount++;
+          return isProvided;
+        });
+
+        const newRows = validRows.map(row => {
+          const matchingComponent = componentsList.find(c => c.componentId === row.componentId);
+          if (matchingComponent && row.unitPrice !== (matchingComponent.suggestedPrice || 0)) {
+            return {
+              ...row,
+              unitPrice: matchingComponent.suggestedPrice || 0,
+              total: row.quantity * (matchingComponent.suggestedPrice || 0)
+            };
+          }
+          return row;
+        });
+
+        if (removedCount > 0 || JSON.stringify(currentRows) !== JSON.stringify(newRows)) {
+          if (removedCount > 0) {
+            setMessageWarning(`Removed ${removedCount} item(s) because they are not provided by this supplier.`);
+            setShowWarning(true);
+          }
+          return newRows;
+        }
+        
+        return currentRows;
+      });
+    }
+  }, [componentsList, isLoadingComponents, selectedSupplierId]);
+  const handleSupplierChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const id = Number(e.target.value);
+    setSelectedSupplierId(id);
+    const supplier = suppliersList.find(s => s.supplierId === id);
+    setSupplierInfo(supplier || null);
+    
+    // Don't wipe out rows if we have a pre-filled draft PO. Let the useEffect update their prices.
+    if (!draftPO) {
+      setRows([]);
+    }
+  };
+
+  const handleFindSupplier = async () => {
+    if (!searchComponent) {
+      setShowWarning(true);
+      setMessageWarning("Please enter a component code or name.");
+      return;
+    }
+
+    setIsSearching(true);
+    try {
+      const allComponents = await componentService.getAllComponents({ search: searchComponent });
+      const data = Array.isArray(allComponents) ? allComponents : (allComponents as any).data || [];
+      
+      if (data.length === 0) {
+        setFoundComponents([]);
+        setMessageWarning("No component found matching your search.");
+        setShowWarning(true);
+        return;
+      }
+
+      setFoundComponents(data);
+      setSearchStep('COMPONENT');
+      setShowSupplierSearch(true);
+    } catch (error) {
+      console.error("Error searching components:", error);
+      setMessageWarning("An error occurred while searching for components.");
+      setShowWarning(true);
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  const handleSelectComponent = async (componentId: number) => {
+    if (isSearchingRef.current) return;
+    isSearchingRef.current = true;
+    setIsSearching(true);
+    try {
+      const suppliers = await componentService.getComponentSuppliers(componentId);
+      
+      // IMPORTANT: If suppliersList is still empty, we must wait for it to load
+      // or fetch it manually here to avoid the "No approved suppliers" false positive.
+      let currentSuppliers = suppliersList;
+      if (currentSuppliers.length === 0) {
+        const fetchedSuppliers = await supplierService.getAllSuppliers();
+        currentSuppliers = Array.isArray(fetchedSuppliers) ? fetchedSuppliers : (fetchedSuppliers as any).data || [];
+      }
+
+      const matchedSuppliers = currentSuppliers.filter(s => 
+        suppliers.some(ss => ss.supplierId === s.supplierId)
+      );
+
+      setFoundSuppliers(matchedSuppliers);
+      setSearchStep('SUPPLIER');
+      setShowSupplierSearch(true);
+      if (matchedSuppliers.length === 0) {
+        setMessageWarning("No approved suppliers found for this component.");
+        setShowWarning(true);
+        setShowSupplierSearch(false);
+      }
+    } catch (error) {
+      console.error("Error finding suppliers:", error);
+      setMessageWarning("An error occurred while searching for components.");
+      setShowWarning(true);
+    } finally {
+      setIsSearching(false);
+      isSearchingRef.current = false;
+    }
+  };
+
+  useEffect(() => {
+    if (showWarning) {
+      const timer = setTimeout(() => {
+        setShowWarning(false);
+      }, 3000);
+
+      return () => clearTimeout(timer);
+    }
+  }, [showWarning])
+
+  const addRow = () => {
+    if (!selectedSupplierId) {
+      setMessageWarning("Please select a supplier first.");
+      setShowWarning(true);
+      return;
+    }
+    setRows([
+      ...rows,
+      { id: Date.now(), componentId: 0, componentName: "", quantity: 1, unitPrice: 0, total: 0 }
+    ]);
+  };
+
+  const removeRow = (id: number) => {
+    setRows(rows.filter(r => r.id !== id));
+  };
+
+  const handleComponentSelect = (rowId: number, compIdStr: string) => {
+    const compId = Number(compIdStr);
+    const comp = componentsList.find(c => c.componentId === compId);
+    
+    if (comp) {
+      setRows(rows.map(r => r.id === rowId ? {
+        ...r,
+        componentId: comp.componentId,
+        componentName: comp.name,
+        unitPrice: comp.suggestedPrice || 0,
+        total: r.quantity * (comp.suggestedPrice || 0)
+      } : r));
+    }
+  };
+
+  const handleRowChange = (rowId: number, field: 'quantity' | 'unitPrice', value: number) => {
+    setRows(rows.map(r => {
+      if (r.id === rowId) {
+        const newVal = Math.max(0, value); 
+        const newTotal = field === 'quantity' ? newVal * r.unitPrice : r.quantity * newVal;
+        return { ...r, [field]: newVal, total: newTotal };
+      }
+      return r;
+    }));
+  };
+
+  const subtotal = rows.reduce((sum, r) => sum + r.total, 0);
+  const taxAmount = subtotal * (taxRate / 100);
+  const grandTotal = subtotal + taxAmount + shippingCost;
+
+  const triggerFileUpload = () => fileInputRef.current?.click();
+
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    if (event.target.files) {
+      const newFiles = Array.from(event.target.files);
+      const uniqueNewFiles = newFiles.filter(newFile => 
+        !attachedFiles.some(existingFile => existingFile.name === newFile.name && existingFile.size === newFile.size)
+      );
+      setAttachedFiles(prev => [...prev, ...uniqueNewFiles]);
+      event.target.value = '';
+    }
+  };
+
+  const handleRemoveFile = (indexToRemove: number) => {
+    setAttachedFiles(prev => prev.filter((_, index) => index !== indexToRemove));
+  };
+
+  const handleSave = async (submitStatus: 'DRAFT' | 'PENDING') => {
+    if (!selectedSupplierId) {
+      setShowWarning(true);
+      setMessageWarning("Please select a supplier");
+      return;
+    }
+    if (!selectedWarehouseId) {
+      setShowWarning(true);
+      setMessageWarning("Please select a destination warehouse");
+      return;
+    }
+    if (rows.length === 0) {
+      setShowWarning(true);
+      setMessageWarning("Please add at least one component");
+      return;
+    }
+    if (rows.some(r => r.componentId === 0)) {
+      setShowWarning(true);
+      setMessageWarning("Please select components for all rows");
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const newPO = await purchaseOrderService.createPO({
+        status: submitStatus,
+        supplierId: Number(selectedSupplierId),
+        warehouseId: Number(selectedWarehouseId),
+        orderDate: orderDate || undefined,
+        expectedDeliveryDate: deliveryDate || undefined,
+        taxRate: taxRate,
+        shippingCost: shippingCost,
+        paymentTerms: paymentTerm,
+        deliveryTerms: deliveryTerm,
+        priority: priority,
+        note: note,
+        details: rows.map(r => ({
+          componentId: r.componentId,
+          quantity: r.quantity,
+          unitPrice: r.unitPrice,
+          productionRequestId: r.productionRequestId || undefined
+        }))
+      });
+
+      const poId = newPO.purchaseOrderId;
+
+      if (attachedFiles.length > 0) {
+        for (const file of attachedFiles) {
+          try {
+            const fileCategory = "OTHER";
+
+            const requestRes = await purchaseOrderService.requestAttachmentUpload(poId, {
+              fileName: file.name,
+              mimeType: file.type,
+              fileSize: file.size,
+              category: fileCategory
+            });
+
+            await purchaseOrderService.uploadFileToR2(requestRes.uploadUrl, file);
+
+            await purchaseOrderService.confirmAttachmentUpload(poId, {
+              fileKey: requestRes.fileKey,
+              fileName: file.name,
+              mimeType: file.type,
+              fileSize: file.size,
+              category: fileCategory
+            });
+
+          } catch (fileError) {
+            console.error(`Lỗi khi upload file ${file.name}:`, fileError);
+          }
+        }
+      }
+
+      setMessage(submitStatus === 'DRAFT' ? "Draft & files saved successfully!" : "Purchase Order & files submitted!");
+      setShowSuccess(true);
+      
+      setOrderDate(new Date().toISOString().split('T')[0]);
+      setDeliveryDate("");
+      setNote("");
+      setRows([]);
+      setSelectedSupplierId("");
+      setSelectedWarehouseId("");
+      setSupplierInfo(null);
+      setAttachedFiles([]);
+      
+      setTimeout(() => {
+        setMessage("");
+        setShowSuccess(false);
+      }, 3000);
+
+    } catch (error: any) {
+      console.error("Failed to handle submit:", error);
+      alert(error?.response?.data?.message || "An error occurred while saving the Purchase Order.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  if (isLoadingData) {
+    return <div className="flex justify-center py-10"><Loader2 className="w-8 h-8 animate-spin text-blue-500"/></div>;
+  }
+
+  return (
+    <div className="space-y-6 pb-8">
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div>
+          <h2 className="text-xl font-bold text-gray-900">New Component Order</h2>
+          <p className="text-sm text-gray-500">Create a purchase order for raw materials.</p>
+        </div>
+      </div>
+
+      <div className="bg-white p-6 rounded-lg border border-gray-200 shadow-sm">
+        <h3 className="text-base font-bold text-gray-900 uppercase tracking-wider flex items-center gap-2 border-b border-gray-100 pb-3 mb-5">
+          <FileText className="w-4 h-4 text-blue-600" /> General Information
+        </h3>
+        
+        <div className="mb-8 p-4 bg-blue-50/50 border border-blue-100 rounded-xl">
+          <label className="text-xs font-bold text-blue-700 uppercase tracking-wider block mb-2">Quick Sourcing</label>
+          <div className="flex gap-2">
+            <div className="relative flex-1">
+              <Search className="absolute left-3 top-2.5 w-4 h-4 text-gray-400" />
+              <input 
+                type="text" 
+                placeholder="Find suppliers who sell a specific component..." 
+                className="w-full pl-9 pr-4 py-2 border border-gray-300 rounded-lg text-sm outline-none focus:ring-2 focus:ring-blue-500 bg-white"
+                value={searchComponent}
+                onChange={(e) => setSearchComponent(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleFindSupplier()}
+              />
+            </div>
+            <button 
+              onClick={handleFindSupplier}
+              disabled={isSearching}
+              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-500 transition-colors text-sm font-medium disabled:bg-blue-300 cursor-pointer"
+            >
+              {isSearching ? <Loader2 className="w-4 h-4 animate-spin" /> : "Find Supplier"}
+            </button>
+          </div>
+          <p className="text-[11px] text-blue-500 mt-2 italic">Tip: Enter a component code or name to see approved vendors.</p>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          
+          <div className="space-y-4 border-r-0 lg:border-r border-gray-100 lg:pr-6">
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-gray-700">Supplier<span className="text-red-500">*</span></label>
+              <select 
+                className="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm bg-white cursor-pointer"
+                value={selectedSupplierId}
+                onChange={handleSupplierChange}
+              >
+                <option value="">-- Select Supplier --</option>
+                {suppliersList.map(s => (
+                  <option key={s.supplierId} value={s.supplierId}>{s.code} - {s.supplierName}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-gray-700">Destination Warehouse<span className="text-red-500">*</span></label>
+              <select 
+                className="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm bg-white cursor-pointer"
+                value={selectedWarehouseId}
+                onChange={(e) => setSelectedWarehouseId(Number(e.target.value))}
+              >
+                <option value="">-- Select Warehouse --</option>
+                {warehousesList.map(w => (
+                  <option key={w.warehouseId} value={w.warehouseId}>{w.warehouseName}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-gray-700">Order Date</label>
+              <input type="date" value={orderDate} onChange={(e) => setOrderDate(e.target.value)}
+              className="w-full p-2.5 border border-gray-200 rounded-lg text-sm outline-none" />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-gray-700">Expected Delivery</label>
+              <input 
+                type="date" 
+                value={deliveryDate} 
+                onChange={(e) => setDeliveryDate(e.target.value)}
+                className="w-full p-2.5 border border-gray-300 rounded-lg text-sm outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer" 
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-gray-700">Priority</label>
+              <select 
+                value={priority}
+                onChange={(e) => setPriority(e.target.value)}
+                className="w-full p-2.5 border border-gray-300 rounded-lg text-sm bg-white outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
+              >
+                <option value="HIGH">High</option>
+                <option value="MEDIUM">Medium</option>
+                <option value="LOW">Low</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="lg:col-span-2 flex flex-col">
+            <label className="text-sm font-medium text-gray-700 block mb-2">Supplier Details</label>
+            
+            {supplierInfo ? (
+              <div className="bg-blue-50/40 border border-blue-100 rounded-lg p-5 flex-1 relative overflow-hidden">
+                <div className="absolute top-0 right-0 p-4 opacity-5">
+                    <Building2 className="w-32 h-32" />
+                </div>
+                
+                <div className="relative z-10">
+                  <div className="flex items-center gap-4 mb-5 pb-4 border-b border-blue-100/60">
+                    <div className="w-12 h-12 bg-blue-100 text-blue-700 rounded-xl flex items-center justify-center font-bold text-xl shadow-sm border border-blue-200">
+                      {supplierInfo.supplierName.charAt(0)}
+                    </div>
+                    <div>
+                      <h4 className="font-bold text-gray-900 text-xl">{supplierInfo.supplierName}</h4>
+                      <p className="text-sm text-blue-600 font-mono font-medium mt-0.5">Code: {supplierInfo.code}</p>
+                    </div>
+                  </div>
+                  
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-y-5 gap-x-6">
+                    <div className="flex gap-3">
+                      <Mail className="w-5 h-5 text-gray-400 flex-shrink-0" />
+                      <div>
+                        <span className="block text-xs text-gray-500 uppercase font-semibold">Email Address</span>
+                        <span className="text-sm text-gray-900 font-medium">{supplierInfo.email || 'N/A'}</span>
+                      </div>
+                    </div>
+                    <div className="flex gap-3">
+                      <Phone className="w-5 h-5 text-gray-400 flex-shrink-0" />
+                      <div>
+                        <span className="block text-xs text-gray-500 uppercase font-semibold">Phone Number</span>
+                        <span className="text-sm text-gray-900 font-medium">{supplierInfo.phoneNumber || 'N/A'}</span>
+                      </div>
+                    </div>
+                    <div className="md:col-span-2 flex gap-3">
+                      <MapPin className="w-5 h-5 text-gray-400 flex-shrink-0" />
+                      <div>
+                        <span className="block text-xs text-gray-500 uppercase font-semibold">Physical Address</span>
+                        <span className="text-sm text-gray-900 font-medium leading-relaxed">{supplierInfo.address || 'N/A'}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="border-2 border-dashed border-gray-200 rounded-lg p-5 flex-1 flex flex-col items-center justify-center text-center bg-gray-50/50">
+                 <div className="w-14 h-14 bg-white border border-gray-100 shadow-sm rounded-full flex items-center justify-center mb-3">
+                   <Building2 className="w-6 h-6 text-gray-400" />
+                 </div>
+                 <p className="text-sm font-medium text-gray-600">No Supplier Selected</p>
+                 <p className="text-xs text-gray-500 mt-1 max-w-xs">Please select a supplier from the list to view their contact details and address.</p>
+              </div>
+            )}
+          </div>
+
+        </div>
+      </div>
+
+      <div className="bg-white p-6 rounded-lg border border-gray-200 shadow-sm min-h-[300px]">
+        <div className="flex justify-between items-center mb-4 border-b border-gray-100 pb-2">
+            <h3 className="text-base font-bold text-gray-900 uppercase tracking-wider flex items-center gap-2">
+                <FileText className="w-4 h-4 text-blue-600" /> Items Details
+                {isLoadingComponents && <Loader2 className="w-4 h-4 animate-spin text-blue-500" />}
+            </h3>
+            <button 
+                onClick={addRow}
+                className="flex items-center gap-2 px-3 py-1.5 bg-blue-50 text-blue-600 rounded-md hover:bg-blue-100 transition-colors text-sm font-medium cursor-pointer"
+            >
+                <Plus className="w-4 h-4" /> Add Item
+            </button>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[800px] border-collapse">
+            <thead>
+              <tr className="bg-gray-50 border-b border-gray-200 
+              text-left text-xs uppercase text-gray-500 font-semibold">
+                <th className="p-3 w-[500px]">Component Name*</th>
+                <th className="p-3">ID</th>
+                <th className="p-3 text-right w-[100px]">Qty*</th>
+                <th className="p-3 text-right w-[120px]">Unit Price ($)*</th>
+                <th className="p-3 text-right w-[120px]">Total ($)</th>
+                <th className="p-3 w-[50px]"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.id} className="border-b border-gray-100 hover:bg-gray-50 transition-colors">
+                  <td className="p-3">
+                    <select 
+                      className="w-full p-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer disabled:bg-gray-100"
+                      value={row.componentId}
+                        onChange={(e) => handleComponentSelect(row.id, e.target.value)}
+                      >
+                        <option value="0">{isLoadingComponents ? "Loading..." : "Select Component..."}</option>
+                        {row.componentId !== 0 && !componentsList.find(c => c.componentId === row.componentId) && (
+                          <option value={row.componentId}>{row.componentName}</option>
+                        )}
+                      {componentsList.map(c => (
+                        <option key={c.componentId} value={c.componentId}>{c.name}</option>
+                      ))}
+                    </select>
+                  </td>
+                  <td className="p-3 text-sm text-gray-600">{row.componentId || '-'}</td>
+                  <td className="p-3">
+                    <input 
+                      type="number" min="1"
+                      className="w-full p-2 border border-gray-300 rounded text-right text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      value={row.quantity}
+                      onChange={(e) => handleRowChange(row.id, 'quantity', parseInt(e.target.value) || 0)}
+                    />
+                  </td>
+                  <td className="p-3">
+                    <input 
+                        type="number" min="0"
+                        className="w-full p-2 border border-gray-300 rounded text-right text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
+                        value={row.unitPrice}
+                        onChange={(e) => handleRowChange(row.id, 'unitPrice', parseFloat(e.target.value) || 0)}
+                    />
+                  </td>
+                  <td className="p-3 text-right text-sm font-medium text-gray-900">
+                    {row.total.toLocaleString()}
+                  </td>
+                  <td className="p-3 text-center">
+                    <button onClick={() => removeRow(row.id)} className="text-red-400 hover:text-red-600 p-1.5 rounded transition-colors cursor-pointer">
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {rows.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="p-8 text-center text-gray-400 italic text-sm">
+                    No items added yet. Click "Add Item" to start.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+          <div className="bg-white p-6 rounded-lg border border-gray-200 shadow-sm space-y-6">
+             <div className="space-y-4">
+                <h4 className="text-sm font-bold text-gray-700 border-b border-gray-100 pb-2">Terms & Conditions</h4>
+                <div className="grid grid-cols-1 gap-4">
+                    <div>
+                        <label className="text-xs font-medium text-gray-500 block mb-1">Payment Terms</label>
+                        <select 
+                            value={paymentTerm} onChange={(e) => setPaymentTerm(e.target.value)}
+                            className="w-full p-2 border border-gray-300 rounded-md text-sm outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer"
+                        >
+                            <option value="Net 30">Net 30</option>
+                            <option value="Due upon receipt">Due upon receipt</option>
+                            <option value="50% Advance">50% Advance, 50% on delivery</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label className="text-xs font-medium text-gray-500 block mb-1">Delivery Terms</label>
+                        <select 
+                            value={deliveryTerm} onChange={(e) => setDeliveryTerm(e.target.value)}
+                            className="w-full p-2 border border-gray-300 rounded-md text-sm outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer"
+                        >
+                            <option value="FOB - Free On Board">FOB - Free On Board</option>
+                            <option value="CIF - Cost, Insurance and Freight">CIF - Cost, Insurance and Freight</option>
+                            <option value="DDP - Delivered Duty Paid">DDP - Delivered Duty Paid</option>
+                            <option value="EXW - Ex Works">EXW - Ex Works</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label className="text-xs font-medium text-gray-500 block mb-1">Internal Note</label>
+                        <textarea 
+                            value={note} onChange={(e) => setNote(e.target.value)}
+                            placeholder="Add specific instructions for suppliers..."
+                            rows={2}
+                            className="w-full p-2 border border-gray-300 rounded-md text-sm outline-none focus:ring-1 focus:ring-blue-500 resize-none"
+                        ></textarea>
+                    </div>
+
+                    {hasPermission("ATTACH_UPLOAD") && (
+                      <div className="pt-3 border-t border-gray-100 space-y-3">
+                        <div className="flex items-center justify-between gap-2">
+                            <div>
+                                <label className="text-sm font-bold text-gray-800 flex items-center gap-1.5">
+                                    <Paperclip className="w-4 h-4 text-gray-400" /> Attached Documents
+                                </label>
+                                <p className="text-xs text-gray-500 mt-0.5">Upload supporting files like contracts, receipts, evidence (Multiple allowed)</p>
+                            </div>
+                            <input 
+                                type="file" 
+                                multiple 
+                                ref={fileInputRef} 
+                                onChange={handleFileChange}
+                                className="hidden" 
+                            />
+                            <button 
+                                type="button"
+                                onClick={triggerFileUpload}
+                                className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-800 text-sm font-semibold rounded-lg flex items-center gap-2 transition-colors cursor-pointer"
+                            >
+                                <Plus className="w-4 h-4" /> Upload Files
+                            </button>
+                        </div>
+
+                        {attachedFiles.length > 0 && (
+                            <div className="grid grid-cols-1 gap-2 pt-2">
+                                {attachedFiles.map((file, index) => (
+                                    <div key={`${file.name}-${index}`} className="flex items-center justify-between gap-2 bg-gray-50 p-2 rounded border border-gray-200 group">
+                                        <div className="flex items-center gap-2 min-w-0 flex-1">
+                                            <Paperclip className="w-4 h-4 text-gray-400 flex-shrink-0" />
+                                            <div className="flex flex-col min-w-0">
+                                                <span className="text-sm text-gray-700 font-medium truncate" title={file.name}>{file.name}</span>
+                                                <span className="text-xs text-gray-400">{(file.size / 1024).toFixed(1)} KB</span>
+                                            </div>
+                                        </div>
+                                        <button 
+                                            type="button"
+                                            onClick={() => handleRemoveFile(index)}
+                                            className="p-1 rounded-full text-gray-400 hover:bg-red-50 hover:text-red-600 transition-colors opacity-0 group-hover:opacity-100 cursor-pointer"
+                                            title="Remove file"
+                                        >
+                                            <X className="w-4 h-4" />
+                                        </button>
+                                    </div>
+                                ))}
+                            </div>
+                          )}
+                      </div>
+                    )}
+                    
+                </div>
+             </div>
+          </div>
+
+          <div className="bg-gray-50 p-6 rounded-lg border border-gray-200 shadow-sm flex flex-col justify-between">
+             <div className="space-y-4">
+                 <div className="flex justify-between items-center text-sm text-gray-600">
+                   <span>Subtotal</span>
+                   <span className="font-semibold text-gray-900">${subtotal.toLocaleString()}</span>
+                 </div>
+                 
+                 <div className="flex justify-between items-center text-sm text-gray-600">
+                   <div className="flex items-center gap-2">
+                     <span>Tax Rate (%)</span>
+                     <input 
+                        type="number" 
+                        min="0"
+                        value={taxRate} 
+                        onChange={(e) => setTaxRate(Math.max(0, parseFloat(e.target.value) || 0))}
+                        className="w-16 p-1 border border-gray-300 rounded text-right text-sm font-medium bg-white outline-none focus:ring-1 focus:ring-blue-500"
+                     />
+                   </div>
+                   <span className="font-medium text-gray-900">${taxAmount.toLocaleString()}</span>
+                 </div>
+
+                 <div className="flex justify-between items-center text-sm text-gray-600">
+                   <span>Shipping ($)</span>
+                   <input 
+                      type="number" 
+                      min="0"
+                      value={shippingCost} 
+                      onChange={(e) => setShippingCost(Math.max(0, parseFloat(e.target.value) || 0))}
+                      className="w-24 p-1 border border-gray-300 rounded text-right text-sm font-medium bg-white outline-none focus:ring-1 focus:ring-blue-500"
+                   />
+                 </div>
+                 <div className="pt-4 border-t-2 border-gray-200 flex justify-between items-center">
+                   <span className="text-lg font-bold text-gray-900">Grand Total</span>
+                   <span className="text-2xl font-bold text-blue-600">${grandTotal.toLocaleString()}</span>
+                 </div>
+             </div>
+
+             <div className="mt-8 flex justify-end gap-3">
+                <button 
+                  onClick={() => handleSave('DRAFT')}
+                  disabled={isSubmitting}
+                  className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 text-gray-700 font-medium rounded-lg hover:bg-gray-50 transition-colors text-sm cursor-pointer disabled:opacity-70"
+                >
+                  {isSubmitting ? <Loader2 className="w-4 h-4 animate-spin"/> : <Save className="w-4 h-4" />}
+                  Save Draft
+                </button>
+
+                <button 
+                    onClick={() => handleSave('PENDING')}
+                    disabled={isSubmitting}
+                    className="flex items-center gap-2 px-8 py-3 bg-[#2EE59D] text-white font-bold rounded-lg hover:bg-[#25D390] transition-colors shadow-md disabled:opacity-70 cursor-pointer"
+                >
+                   {isSubmitting ? <Loader2 className="w-4 h-4 animate-spin"/> : <Send className="w-4 h-4" />}
+                   {isSubmitting ? "Submitting..." : "Submit Order"}
+                </button>
+             </div>
+          </div>
+      </div>
+
+      <SuccessNotification isVisible={showSuccess} message={message}/>
+      <WarningNotification isVisible={showWarning} message={messageWarning} onClose={() => {setShowWarning(false);}}/>
+      {showSupplierSearch && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-200">
+            <div className="p-4 border-b border-gray-100 flex justify-between items-center bg-gray-50">
+              <h3 className="font-bold text-gray-900">
+                {searchStep === 'COMPONENT' ? 'Find Component' : 'Select Approved Supplier'}
+              </h3>
+              <button onClick={() => { setShowSupplierSearch(false); setFoundComponents([]); setFoundSuppliers([]); setSearchComponent(""); setSearchStep('COMPONENT'); }} className="text-gray-400 hover:text-gray-600 transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6 space-y-4">
+              {searchStep === 'COMPONENT' ? (
+                <>
+                  <div className="flex gap-2">
+                    <div className="relative flex-1">
+                      <Search className="absolute left-3 top-2.5 w-4 h-4 text-gray-400" />
+                      <input 
+                        type="text" 
+                        placeholder="Enter component code or name..." 
+                        className="w-full pl-9 pr-4 py-2 border border-gray-300 rounded-lg text-sm outline-none focus:ring-2 focus:ring-blue-500"
+                        value={searchComponent}
+                        onChange={(e) => setSearchComponent(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && handleFindSupplier()}
+                      />
+                    </div>
+                    <button 
+                      onClick={handleFindSupplier}
+                      disabled={isSearching}
+                      className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-500 transition-colors text-sm font-medium disabled:bg-blue-300 cursor-pointer"
+                    >
+                      {isSearching ? <Loader2 className="w-4 h-4 animate-spin" /> : "Search"}
+                    </button>
+                  </div>
+                  
+                  {foundComponents.length > 0 && (
+                    <div className="max-h-60 overflow-y-auto space-y-2">
+                      <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Matching Components</p>
+                      {foundComponents.map(c => (
+                        <button 
+                          key={c.componentId}
+                          onClick={() => handleSelectComponent(c.componentId)}
+                          className="w-full text-left p-3 border border-gray-200 rounded-lg hover:bg-blue-50 hover:border-blue-200 transition-all group flex justify-between items-center"
+                        >
+                          <div>
+                            <span className="block font-medium text-gray-900 group-hover:text-blue-700">{c.componentName}</span>
+                            <span className="block text-xs text-gray-500">{c.code}</span>
+                          </div>
+                          <div className="text-blue-600 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <Plus className="w-4 h-4" />
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  
+                  {foundComponents.length === 0 && !isSearching && searchComponent && (
+                    <div className="text-center py-6 text-gray-400 text-sm italic">
+                      No matching components found.
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <button 
+                    onClick={() => setSearchStep('COMPONENT')}
+                    className="text-xs text-blue-600 hover:underline mb-2 flex items-center gap-1"
+                  >
+                    ← Back to components
+                  </button>
+                  <div className="max-h-60 overflow-y-auto space-y-2">
+                    <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Approved Suppliers</p>
+                    {foundSuppliers.map(s => (
+                      <button 
+                        key={s.supplierId}
+                        onClick={() => {
+                          setSelectedSupplierId(s.supplierId);
+                          setSupplierInfo(s);
+                          setShowSupplierSearch(false);
+                          setFoundComponents([]);
+                          setFoundSuppliers([]);
+                          setSearchComponent("");
+                          setSearchStep('COMPONENT');
+                        }}
+                        className="w-full text-left p-3 border border-gray-200 rounded-lg hover:bg-blue-50 hover:border-blue-200 transition-all group flex justify-between items-center"
+                      >
+                        <div>
+                          <span className="block font-medium text-gray-900 group-hover:text-blue-700">{s.supplierName}</span>
+                          <span className="block text-xs text-gray-500">{s.code}</span>
+                        </div>
+                        <div className="text-blue-600 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <Plus className="w-4 h-4" />
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                  {foundSuppliers.length === 0 && (
+                    <div className="text-center py-6 text-gray-400 text-sm italic">
+                      No approved suppliers found for this component.
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
